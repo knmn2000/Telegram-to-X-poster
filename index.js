@@ -36,10 +36,12 @@ class TelegramToXPoster {
     this.sessionFile = "./telegram_session.txt";
     this.processedVideosFile = "./processed_videos.json";
     this.offsetFile = "./video_offset.json";
+    this.failedVideosFile = "./failed_videos.json";
 
     // Initialize Telegram client
     this.telegramClient = null;
     this.processedVideos = this.loadProcessedVideos();
+    this.failedVideos = this.loadFailedVideos();
     this.currentOffset = this.loadOffset();
   }
 
@@ -188,6 +190,80 @@ class TelegramToXPoster {
     }
   }
 
+  loadFailedVideos() {
+    try {
+      if (fs.existsSync(this.failedVideosFile)) {
+        const data = fs.readFileSync(this.failedVideosFile, "utf8");
+        const failedData = JSON.parse(data);
+
+        // Handle both old format (array) and new format (object with metadata)
+        if (Array.isArray(failedData)) {
+          const videoSet = new Set(failedData);
+          console.log(
+            `📂 Loaded ${videoSet.size} failed videos (legacy format)`
+          );
+          return videoSet;
+        } else {
+          const videoSet = new Set(failedData.videos || []);
+          console.log(`📂 Loaded ${videoSet.size} failed videos`);
+          return videoSet;
+        }
+      }
+    } catch (error) {
+      console.log("⚠️  Could not load failed videos list, starting fresh");
+    }
+    return new Set();
+  }
+
+  saveFailedVideos() {
+    try {
+      const dataToSave = {
+        lastUpdated: new Date().toISOString(),
+        totalFailed: this.failedVideos.size,
+        videos: [...this.failedVideos],
+      };
+
+      fs.writeFileSync(
+        this.failedVideosFile,
+        JSON.stringify(dataToSave, null, 2)
+      );
+      console.log(`💾 Saved ${this.failedVideos.size} failed video records`);
+    } catch (error) {
+      console.error("❌ Error saving failed videos list:", error);
+    }
+  }
+
+  addFailedVideo(videoId, reason, error = null) {
+    const failureRecord = {
+      videoId,
+      reason,
+      timestamp: new Date().toISOString(),
+      error: error ? error.message : null,
+    };
+
+    this.failedVideos.add(JSON.stringify(failureRecord));
+    this.saveFailedVideos();
+    console.log(`❌ Marked video as failed: ${reason}`);
+  }
+
+  isVideoFailed(videoId) {
+    // Check if any failed video record contains this videoId
+    for (const failedRecord of this.failedVideos) {
+      try {
+        const record = JSON.parse(failedRecord);
+        if (record.videoId === videoId) {
+          return true;
+        }
+      } catch (error) {
+        // Handle legacy format where failed videos were just IDs
+        if (failedRecord === videoId) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   generateVideoId(message) {
     // Create a more robust unique identifier using multiple message properties
     const peerId =
@@ -228,14 +304,28 @@ class TelegramToXPoster {
 
         const videoId = this.generateVideoId(message);
 
-        // Check if this video has been processed
-        if (!this.processedVideos.has(videoId)) {
+        // Check if this video has been processed or failed
+        if (
+          !this.processedVideos.has(videoId) &&
+          !this.isVideoFailed(videoId)
+        ) {
           console.log(
             `🎯 Found oldest unprocessed video: Message ID ${
               message.id
             } (batch ${Math.ceil(currentBatch / batchSize)})`
           );
           return message;
+        }
+
+        // Skip if already processed or failed
+        if (this.processedVideos.has(videoId)) {
+          console.log(
+            `⏭️  Skipping already processed video: Message ID ${message.id}`
+          );
+        } else if (this.isVideoFailed(videoId)) {
+          console.log(
+            `⏭️  Skipping previously failed video: Message ID ${message.id}`
+          );
         }
 
         // Show progress every 25 videos
@@ -265,74 +355,184 @@ class TelegramToXPoster {
   }
 
   async extractVideoCaption(videoMessage) {
-    console.log("📝 Extracting video caption...");
-
-    let caption = "";
+    console.log("📝 Extracting video caption with AI assistance...");
 
     // First, check if the video message itself has text
     if (videoMessage.message && videoMessage.message.trim()) {
-      caption = videoMessage.message.trim();
+      const caption = videoMessage.message.trim();
       console.log("✅ Found caption in video message");
       return caption;
     }
 
-    // If no caption in video message, check surrounding messages
+    // Get surrounding messages (-2 to +2) for AI analysis
     try {
       const entity = await this.telegramClient.getEntity(this.groupName);
 
-      // Get messages around the video message
+      // Get a wider range of messages around the video
+      const messageIds = [
+        videoMessage.id - 2,
+        videoMessage.id - 1,
+        videoMessage.id,
+        videoMessage.id + 1,
+        videoMessage.id + 2,
+      ];
+
+      console.log("🔍 Fetching surrounding messages for context analysis...");
       const surroundingMessages = await this.telegramClient.getMessages(
         entity,
         {
-          ids: [videoMessage.id - 1, videoMessage.id, videoMessage.id + 1],
+          ids: messageIds,
         }
       );
 
-      // Check message before video
-      const messageBefore = surroundingMessages.find(
-        (m) => m.id === videoMessage.id - 1
-      );
-      if (
-        messageBefore &&
-        messageBefore.message &&
-        messageBefore.message.trim()
-      ) {
-        // Check if it's from the same sender and within reasonable time
-        const timeDiff = Math.abs(videoMessage.date - messageBefore.date);
-        if (
-          messageBefore.senderId === videoMessage.senderId &&
-          timeDiff < 300
-        ) {
-          // 5 minutes
-          caption = messageBefore.message.trim();
-          console.log("✅ Found caption in message before video");
-          return caption;
-        }
+      // Filter out the video message itself and empty messages
+      const contextMessages = surroundingMessages
+        .filter(
+          (msg) =>
+            msg &&
+            msg.id !== videoMessage.id &&
+            msg.message &&
+            msg.message.trim()
+        )
+        .map((msg) => ({
+          id: msg.id,
+          text: msg.message.trim(),
+          senderId: msg.senderId,
+          date: msg.date,
+          position: msg.id < videoMessage.id ? "before" : "after",
+          timeDiff: Math.abs(videoMessage.date - msg.date),
+        }))
+        .sort((a, b) => a.id - b.id); // Sort by message order
+
+      if (contextMessages.length === 0) {
+        console.log("ℹ️  No surrounding messages found");
+        return "";
       }
 
-      // Check message after video
-      const messageAfter = surroundingMessages.find(
-        (m) => m.id === videoMessage.id + 1
+      console.log(
+        `🔍 Found ${contextMessages.length} surrounding messages, analyzing relevance...`
       );
-      if (messageAfter && messageAfter.message && messageAfter.message.trim()) {
-        const timeDiff = Math.abs(messageAfter.date - videoMessage.date);
-        if (messageAfter.senderId === videoMessage.senderId && timeDiff < 300) {
-          // 5 minutes
-          caption = messageAfter.message.trim();
-          console.log("✅ Found caption in message after video");
-          return caption;
-        }
+
+      // Use AI to determine which message is most relevant as a caption
+      const relevantCaption = await this.findRelevantCaption(
+        videoMessage,
+        contextMessages
+      );
+
+      if (relevantCaption) {
+        console.log(`✅ AI found relevant caption: "${relevantCaption}"`);
+        return relevantCaption;
       }
+
+      console.log("ℹ️  No relevant caption found by AI analysis");
+      return "";
     } catch (error) {
       console.log("⚠️  Could not fetch surrounding messages:", error.message);
+      return "";
     }
+  }
 
-    console.log("ℹ️  No caption found for this video");
-    return "";
+  async findRelevantCaption(videoMessage, contextMessages) {
+    if (contextMessages.length === 0) return "";
+
+    try {
+      // Prepare context for AI analysis
+      const messageContext = contextMessages
+        .map(
+          (msg) =>
+            `Message ${msg.id} (${msg.position} video, ${msg.timeDiff}s apart): "${msg.text}"`
+        )
+        .join("\n");
+
+      const prompt = `I have a video message and several surrounding text messages. Help me identify which message, if any, would be the best caption for this video.
+
+Video Message ID: ${videoMessage.id}
+Video Date: ${new Date(videoMessage.date * 1000).toISOString()}
+
+Surrounding Messages:
+${messageContext}
+
+Please analyze these messages and determine:
+1. Which message (if any) is most likely to be a caption for the video
+2. Consider factors like: timing proximity, sender relationship, content relevance, typical social media posting patterns
+
+Respond with ONLY the exact text of the most relevant message, or NONE if no message seems relevant as a caption.
+Do not add any explanation, formatting, or quotation marks - just the raw message text or NONE.`;
+
+      const response = await this.openaiClient.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are an expert at analyzing social media message patterns to identify captions for videos. You understand timing, context, and typical posting behaviors.",
+          },
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+        max_tokens: 150,
+        temperature: 0.3, // Lower temperature for more consistent analysis
+      });
+
+      let aiResponse = response.choices[0].message.content.trim();
+
+      // Clean up the AI response - remove surrounding quotes if present
+      if (
+        (aiResponse.startsWith('"') && aiResponse.endsWith('"')) ||
+        (aiResponse.startsWith("'") && aiResponse.endsWith("'"))
+      ) {
+        aiResponse = aiResponse.slice(1, -1).trim();
+      }
+
+      if (aiResponse === "NONE" || !aiResponse) {
+        return "";
+      }
+
+      // Verify the AI response matches one of our context messages
+      const matchingMessage = contextMessages.find(
+        (msg) =>
+          msg.text === aiResponse ||
+          msg.text.includes(aiResponse) ||
+          aiResponse.includes(msg.text)
+      );
+
+      if (matchingMessage) {
+        console.log(
+          `🤖 AI selected message ${matchingMessage.id} (${matchingMessage.position} video)`
+        );
+        return aiResponse;
+      } else {
+        console.log(
+          "⚠️  AI response didn't match any context message, using fallback"
+        );
+        // Fallback to simple logic for same sender within 5 minutes
+        const fallbackMessage = contextMessages.find(
+          (msg) => msg.senderId === videoMessage.senderId && msg.timeDiff < 300
+        );
+        return fallbackMessage ? fallbackMessage.text : "";
+      }
+    } catch (error) {
+      console.log("⚠️  AI caption analysis failed:", error.message);
+
+      // Fallback to simple logic
+      console.log("🔄 Using fallback logic...");
+      const fallbackMessage = contextMessages.find(
+        (msg) => msg.senderId === videoMessage.senderId && msg.timeDiff < 300
+      );
+      return fallbackMessage ? fallbackMessage.text : "";
+    }
   }
 
   async rewriteCaption(originalCaption) {
-    if (!originalCaption || !originalCaption.trim()) {
+    // Ensure we have a valid string to work with
+    const cleanCaption =
+      originalCaption && typeof originalCaption === "string"
+        ? originalCaption.trim()
+        : "";
+
+    if (!cleanCaption) {
       console.log("ℹ️  No caption to rewrite, using default");
       return "🎥 Interesting video content";
     }
@@ -345,24 +545,35 @@ class TelegramToXPoster {
         messages: [
           {
             role: "system",
-            content: process.env.OPENAI_SYSTEM_PROMPT,
+            content:
+              process.env.OPENAI_SYSTEM_PROMPT ||
+              "You are a social media content creator. Rewrite the given caption to make it more engaging for Twitter/X while keeping the same meaning. Make it concise (under 250 characters), engaging, and suitable for a general audience. Don't use hashtags unless they were in the original. Keep the tone similar to the original but make it more polished.",
           },
           {
             role: "user",
-            content: `Rewrite this caption: "${originalCaption}"`,
+            content: `Rewrite this caption: ${cleanCaption}`,
           },
         ],
         max_tokens: 100,
         temperature: 0.7,
       });
 
-      const rewrittenCaption = response.choices[0].message.content.trim();
-      console.log(`✅ Caption rewritten: "${rewrittenCaption}"`);
+      let rewrittenCaption = response.choices[0].message.content.trim();
+
+      // Clean up the AI response - remove surrounding quotes if present
+      if (
+        (rewrittenCaption.startsWith('"') && rewrittenCaption.endsWith('"')) ||
+        (rewrittenCaption.startsWith("'") && rewrittenCaption.endsWith("'"))
+      ) {
+        rewrittenCaption = rewrittenCaption.slice(1, -1).trim();
+      }
+
+      console.log(`✅ Caption rewritten: ${rewrittenCaption}`);
       return rewrittenCaption;
     } catch (error) {
       console.log("⚠️  OpenAI caption rewriting failed:", error.message);
       console.log("📝 Using original caption as fallback");
-      return originalCaption;
+      return cleanCaption || "🎥 Video from Telegram";
     }
   }
 
@@ -459,44 +670,122 @@ class TelegramToXPoster {
   }
 
   async run() {
+    const maxVideosPerRun = 1; // Process only 1 video per run (perfect for daily cron jobs)
+    let processedCount = 0;
+    let failedCount = 0;
+
     try {
       await this.initialize();
 
-      // Find oldest unprocessed video
-      const videoMessage = await this.findOldestUnprocessedVideo();
+      console.log("🚀 Starting daily video processing (1 video per run)");
 
-      if (!videoMessage) {
-        console.log("✅ No new videos to process. All caught up!");
-        return;
+      while (processedCount + failedCount < maxVideosPerRun) {
+        let videoPath = null;
+        let videoMessage = null;
+
+        try {
+          // Find oldest unprocessed video
+          videoMessage = await this.findOldestUnprocessedVideo();
+
+          if (!videoMessage) {
+            console.log("✅ No more videos to process. All caught up!");
+            break;
+          }
+
+          const videoId = this.generateVideoId(videoMessage);
+          console.log(`🎬 Processing video: Message ID ${videoMessage.id}`);
+
+          // Extract original caption
+          const originalCaption = await this.extractVideoCaption(videoMessage);
+          console.log(
+            `📝 Original caption: ${originalCaption || "(no caption)"}`
+          );
+
+          // Rewrite caption using OpenAI
+          const rewrittenCaption = await this.rewriteCaption(originalCaption);
+          console.log(`✨ Final caption: ${rewrittenCaption}`);
+
+          // Download video
+          videoPath = await this.downloadVideo(videoMessage);
+
+          // Upload to Twitter - this is where most failures occur
+          await this.uploadToTwitter(videoPath, rewrittenCaption);
+
+          // Mark as processed (using improved ID generation)
+          this.processedVideos.add(videoId);
+          this.saveProcessedVideos();
+
+          processedCount++;
+          console.log("🎉 Successfully processed and posted video!");
+        } catch (uploadError) {
+          // Handle specific upload failures
+          console.error(
+            `❌ Failed to process video ${videoMessage?.id}:`,
+            uploadError.message
+          );
+
+          if (videoMessage) {
+            const videoId = this.generateVideoId(videoMessage);
+
+            // Determine failure reason based on error
+            let failureReason = "Unknown upload error";
+
+            if (uploadError.message.includes("video longer than")) {
+              failureReason = "Video too long (>2 minutes)";
+            } else if (
+              uploadError.message.includes("Forbidden") ||
+              uploadError.code === 403
+            ) {
+              failureReason = "Twitter API forbidden (video restrictions)";
+            } else if (
+              uploadError.message.includes("too large") ||
+              uploadError.message.includes("file size")
+            ) {
+              failureReason = "Video file too large";
+            } else if (
+              uploadError.message.includes("format") ||
+              uploadError.message.includes("codec")
+            ) {
+              failureReason = "Unsupported video format";
+            } else if (uploadError.code === 429) {
+              failureReason = "Rate limit exceeded";
+            } else if (uploadError.code >= 400 && uploadError.code < 500) {
+              failureReason = `Client error: ${uploadError.code}`;
+            } else if (uploadError.code >= 500) {
+              failureReason = `Server error: ${uploadError.code}`;
+            }
+
+            // Add to failed videos list
+            this.addFailedVideo(videoId, failureReason, uploadError);
+            failedCount++;
+
+            console.log(
+              "⏭️  Video marked as failed and will be skipped in future runs"
+            );
+          }
+        } finally {
+          // Always cleanup downloaded file for this video
+          if (videoPath) {
+            await this.cleanup(videoPath);
+          }
+        }
+
+        // No delay needed since we only process 1 video per run
       }
 
-      // Extract original caption
-      const originalCaption = await this.extractVideoCaption(videoMessage);
-      console.log(`📝 Original caption: ${originalCaption || "(no caption)"}`);
-
-      // Rewrite caption using OpenAI
-      const rewrittenCaption = await this.rewriteCaption(originalCaption);
-      console.log(`✨ Final caption: ${rewrittenCaption}`);
-
-      // Download video
-      const videoPath = await this.downloadVideo(videoMessage);
-
-      // Upload to Twitter
-      await this.uploadToTwitter(videoPath, rewrittenCaption);
-
-      // Mark as processed (using improved ID generation)
-      const videoId = this.generateVideoId(videoMessage);
-      this.processedVideos.add(videoId);
-      this.saveProcessedVideos();
-
-      // Cleanup downloaded file
-      await this.cleanup(videoPath);
-
-      console.log("🎉 Successfully processed and posted video!");
+      // Summary
+      if (processedCount > 0) {
+        console.log("📊 Run completed successfully - 1 video posted!");
+      } else if (failedCount > 0) {
+        console.log(
+          "📊 Run completed - 1 video failed and marked for skipping"
+        );
+      }
     } catch (error) {
-      console.error("❌ Error during execution:", error);
+      console.error("❌ Critical error during execution:", error);
       process.exit(1);
     } finally {
+      // Disconnect from Telegram
       if (this.telegramClient) {
         await this.telegramClient.disconnect();
         console.log("👋 Disconnected from Telegram");

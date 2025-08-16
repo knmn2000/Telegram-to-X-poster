@@ -7,6 +7,9 @@ telegram_session.txt
 # Processed videos tracking
 processed_videos.json
 
+# Failed videos tracking
+failed_videos.json
+
 # Video offset tracking
 video_offset.json
 

@@ -120,23 +120,33 @@ The script uses an **efficient pagination system** to handle large groups:
 - Day 3: Continues from video 101-150
 - And so on...
 
-### Caption Extraction Logic
+### AI-Enhanced Caption Extraction Logic
 
-The script intelligently extracts captions using multiple strategies:
+The script uses **advanced AI analysis** to find the most relevant captions:
 
 1. **Direct Caption**: First checks if the video message itself contains text
-2. **Previous Message**: If no direct caption, checks the message sent before the video
-3. **Next Message**: If still no caption, checks the message sent after the video
-4. **Smart Filtering**: Only considers surrounding messages if:
-   - They're from the same sender
-   - They're sent within 5 minutes of the video
-   - They contain actual text content
+2. **Context Gathering**: Fetches 5 surrounding messages (-2 to +2 from the video)
+3. **AI Analysis**: Uses OpenAI to analyze all context messages and determine relevance
+4. **Smart Selection**: AI considers:
+   - Timing proximity to the video
+   - Sender relationships
+   - Content relevance to video context
+   - Typical social media posting patterns
+5. **Fallback Logic**: If AI fails, uses traditional logic (same sender, within 5 minutes)
 
-This approach handles various posting patterns:
+**Example AI Analysis:**
 
-- Videos with captions sent together
-- Caption sent before uploading the video
-- Caption sent as a follow-up after the video
+```
+Message 136 (before video, 30s apart): "Wait for it..."
+Message 137 (before video, 10s apart): "This is hilarious 😂"
+[VIDEO MESSAGE 138]
+Message 139 (after video, 5s apart): "LMAO did you see that?"
+Message 140 (after video, 45s apart): "Totally unrelated topic"
+
+AI Result: Selects "This is hilarious 😂" as most relevant caption
+```
+
+This approach handles complex posting patterns that simple logic would miss!
 
 ### File Management
 
@@ -156,20 +166,50 @@ This approach handles various posting patterns:
 ## Files Created
 
 - `telegram_session.txt` - Stores your Telegram session (keep secure!)
-- `processed_videos.json` - Tracks which videos have been posted
+- `processed_videos.json` - Tracks which videos have been successfully posted
+- `failed_videos.json` - Tracks videos that failed to upload (with reasons)
 - `video_offset.json` - Tracks current position in the video list for pagination
 - `downloads/` - Temporary directory for video files (auto-cleaned)
 
 ## Error Handling
 
-The script includes comprehensive error handling for:
+The script includes **intelligent error handling** that gracefully handles failures:
+
+### **Upload Failure Handling**
+
+- **Automatic Skip**: Failed videos are logged and skipped permanently
+- **Detailed Logging**: Records failure reason and timestamp in `failed_videos.json`
+- **Continue Processing**: Script continues with next video instead of crashing
+- **Smart Detection**: Identifies specific failure types:
+  - Videos longer than 2 minutes
+  - File size restrictions
+  - Format/codec issues
+  - Rate limiting
+  - API permission errors
+
+### **Common Error Types**
 
 - Network connectivity issues
-- API rate limits
+- API rate limits (429 errors)
 - File I/O errors
 - Authentication problems
-- Video size limits
+- Video size/duration limits
+- Unsupported video formats
 - Missing captions
+
+### **Failed Video Tracking**
+
+Example `failed_videos.json`:
+
+```json
+{
+  "lastUpdated": "2024-01-15T10:30:00Z",
+  "totalFailed": 3,
+  "videos": [
+    "{\"videoId\":\"123_456_789\",\"reason\":\"Video too long (>2 minutes)\",\"timestamp\":\"2024-01-15T10:30:00Z\"}"
+  ]
+}
+```
 
 ## Security Notes
 
