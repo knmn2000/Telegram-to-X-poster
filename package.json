@@ -1,0 +1,26 @@
+{
+  "name": "telegram-to-x-poster",
+  "version": "1.0.0",
+  "description": "Automatically fetch oldest videos from Telegram groups and post them to X (Twitter)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "telegram": "^2.22.2",
+    "dotenv": "^16.3.1",
+    "twitter-api-v2": "^1.15.1",
+    "input": "^1.0.1",
+    "fs-extra": "^11.2.0"
+  },
+  "keywords": [
+    "telegram",
+    "twitter",
+    "x",
+    "automation",
+    "media"
+  ],
+  "author": "",
+  "license": "MIT"
+}
